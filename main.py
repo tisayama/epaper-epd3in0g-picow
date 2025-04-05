@@ -6,6 +6,11 @@ import io
 import urequests  # MicroPython 用の requests ライブラリ
 import gc # ガーベジコレクションをインポート
 import ujson
+import utime
+import ubinascii
+import ntptime
+from rsa.pkcs1 import sign
+from rsa.key import PrivateKey
 import network
 wlan = network.WLAN(network.STA_IF)
 
@@ -22,6 +27,16 @@ DC_PIN = 21
 CS_PIN = 17
 BUSY_PIN = 12
 
+# OAuth 2.0 トークンエンドポイント
+TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+ACCESS_TOKEN = ''
+
+
+# サービスアカウントのクレデンシャルファイルのパス
+CREDENTIALS_FILE = "service-account-key.json"  # 置き換えてください
+
+
 # Initialize EPD
 epd = epd3in0g.EPD(RST_PIN, DC_PIN, CS_PIN, BUSY_PIN)
 
@@ -31,12 +46,23 @@ def load_config():
     global ssid
     global password
     global url
+    global n
+    global e
+    global d
+    global p
+    global q
         
     with open("credentials.json", "r") as f:
         credential = ujson.load(f)
         ssid = credential["wifi_ssid"]
         password = credential["wifi_password"]
         url = credential["url"]
+                
+        n = credential["n"]
+        e = credential["e"]
+        d = credential["d"]
+        p = credential["p"]
+        q = credential["q"]
 
 # Wi-Fi接続関数
 def connect_wifi():
@@ -44,7 +70,7 @@ def connect_wifi():
     if not wlan.isconnected():
         print('connecting to network...')
         wlan.connect(ssid, password)
-        max_wait = 10
+        max_wait = 30
         while max_wait > 0 and not wlan.isconnected():
              print('.')
              time.sleep(1)
@@ -169,8 +195,11 @@ def display_bmp_from_url(url, epd):
 
     try:
         print(f"Downloading BMP from {url} (stream mode)...")
+        headers = {
+            "Authorization": "Bearer " + ACCESS_TOKEN,
+        }
         # stream=True を使ってレスポンスを取得
-        response = urequests.get(url, stream=True)
+        response = urequests.get(url, headers=headers, stream=True)
 
         if response.status_code == 200:
              print("BMP download successful (stream mode).")
@@ -292,11 +321,6 @@ def display_bmp_from_url(url, epd):
                         green = row_data[pixel_index_in_row + 1]
                         red = row_data[pixel_index_in_row + 2]
 
-                        # ***** ここで新しい色変換関数を呼び出す *****
-                        #epd_color_index = rgb_to_epd_color(red, green, blue, EPD_PALETTE)
-                        # *******************************************
-
-
                         # ***** ディザリング対応の色変換関数を呼び出す *****
                         # ピクセル座標 (x_epd, y_epd) を渡す
                         epd_color_index = rgb_to_epd_color_dithered(red, green, blue, x_epd, y_epd, EPD_PALETTE)
@@ -307,8 +331,6 @@ def display_bmp_from_url(url, epd):
 
 
                      buffer_index = (x_epd + y_epd * epd.width) // 4
-                     #shift = (x_epd % 4) * 2
-                     # 修正: 左のピクセル(x%4==0)が上位ビット(shift=6)に来るように変更
                      shift = (3 - (x_epd % 4)) * 2
                      mask = ~(0b11 << shift)
                      buffer[buffer_index] &= mask
@@ -368,6 +390,135 @@ def display_bmp_from_url(url, epd):
         if response: response.close()
         gc.collect()
 
+def time_sync():
+    global last_ntp_sync
+    ntptime.host = 'time.cloudflare.com'
+    ntptime.timeout = 10
+    ntptime.settime()
+    
+    print("ntp synced")
+    last_ntp_sync = utime.time()
+
+def get_next_runtime():
+    """
+    現在時刻から次の実行時刻(05:20, 11:20, 17:20)までの秒数を計算する
+    Returns:
+        int: 次の実行時刻までの待機秒数
+    """
+    current_time = utime.time() + (9 * 3600)  # UTC+9へ調整
+    current_day = current_time // 86400  # 現在の日付(エポックからの日数)
+    day_seconds = current_time % 86400   # 当日の経過秒数
+
+    # 実行時刻のリスト（1日の秒数に変換）
+    run_times = [
+        (5 * 3600) + (20 * 60),   # 05:20
+        (11 * 3600) + (20 * 60),  # 11:20
+        (17 * 3600) + (20 * 60),  # 17:20
+    ]
+
+    # 今日の残りの実行時刻から探す
+    for run_time in run_times:
+        if day_seconds < run_time:
+            return run_time - day_seconds
+
+    # 今日の実行時刻をすべて過ぎている場合、翌日の最初の時刻まで
+    return (86400 - day_seconds) + run_times[0]
+
+def renew_token():
+    global ACCESS_TOKEN
+    
+    ACCESS_TOKEN = get_access_token(CREDENTIALS_FILE)        
+        
+def get_access_token(credentials_file):
+    """サービスアカウントのクレデンシャルファイルを使用してアクセストークンを取得する"""
+    with open(credentials_file, "r") as f:
+        credentials = ujson.load(f)
+
+
+    print("generating jwt")
+    headers = {"Content-Type": "application/json"} # application/x-www-form-urlencoded
+    data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": generate_jwt_assertion(credentials),
+    }
+
+    print("request access token")
+    response = urequests.post(TOKEN_ENDPOINT, headers=headers, data=ujson.dumps(data), timeout=30)
+
+    if response.status_code == 200:
+        access_token = response.json()["access_token"]
+        response.close()
+        return access_token
+    else:
+        print(
+            f"Error getting access token: {response.status_code} {response.text}"
+        )
+        response.close()
+        return None
+    
+def generate_jwt_assertion(credentials):
+    """JWTアサーションを生成する"""
+    # ペイロード
+    now = int(utime.time())
+    payload = {
+        "iss": credentials["client_email"],
+        "sub": credentials["client_email"],
+        "aud": TOKEN_ENDPOINT,
+        "iat": now,
+        "exp": now + 3600,  # 有効期限: 1時間
+        "scope": "https://www.googleapis.com/auth/devstorage.read_only",
+    }
+    
+    return jwt_encode(payload, credentials["private_key"])
+
+def _to_b64url(data):
+    return (
+        ubinascii.b2a_base64(data)
+        .rstrip(b"\n")
+        .rstrip(b"=")
+        .replace(b"+", b"-")
+        .replace(b"/", b"_")
+    )
+
+
+def _from_b64url(data):
+    return ubinascii.a2b_base64(data.replace(b"-", b"+").replace(b"_", b"/") + b"===")
+
+
+class exceptions:
+    class PyJWTError(Exception):
+        pass
+
+    class InvalidTokenError(PyJWTError):
+        pass
+
+    class InvalidAlgorithmError(PyJWTError):
+        pass
+
+    class InvalidSignatureError(PyJWTError):
+        pass
+
+    class ExpiredTokenError(PyJWTError):
+        pass
+
+def jwt_encode(payload, pem_content, algorithm="RS256"):
+    global n
+    global e
+    global d
+    global p
+    global q
+    
+    if algorithm != "RS256":
+        raise exceptions.InvalidAlgorithmError()
+
+    key = PrivateKey(n, e, d, p, q)
+    
+    header = _to_b64url(ujson.dumps({"typ": "JWT", "alg": algorithm}).encode())
+    payload = _to_b64url(ujson.dumps(payload).encode())
+    message = header + b"." + payload
+    signature = _to_b64url(sign(message, key, "SHA-256"))
+    return (header + b"." + payload + b"." + signature).decode()
+
 
 # main関数
 def main():
@@ -386,6 +537,9 @@ def main():
         epd.Clear()
 
         machine.reset()
+        
+    time_sync()
+    renew_token()
     
     gc.collect()
     print(f"Initial memory free: {gc.mem_free()} bytes")
@@ -399,20 +553,23 @@ def main():
     gc.collect()
     print(f"Memory free after display attempt: {gc.mem_free()} bytes")
 
-    print("Putting EPD to sleep.")
-    epd.sleep()
-    print("EPD is sleeping.")
 
-    print("Waiting 10 seconds before sleep...")
-    machine.lightsleep(10000)
 
-    print("Finished.")
-    
     wlan.disconnect()
     wlan.active(False)
     
+    
     machine.Pin(23, machine.Pin.OUT).low()
-    machine.deepsleep(300000)
+    wait_time = get_next_runtime() * 1000  # ミリ秒に変換
+    if wait_time > 1800 * 1000:
+        wait_time = 1800 * 1000
+    print(f"Sleeping for {wait_time / 1000} seconds until next run.")
+    
+    print("Putting EPD to sleep.")
+    epd.sleep()
+    print("EPD is sleeping.")
+    
+    machine.deepsleep(wait_time)
 
 if __name__ == "__main__":
     main()
