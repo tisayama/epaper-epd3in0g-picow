@@ -315,7 +315,8 @@ def display_bmp_from_url(url, epd):
 
                  # --- 1行分のピクセルを処理してバッファに書き込む ---
                  for x_epd in range(epd.width):
-                     pixel_index_in_row = x_epd * 3
+                     x_bmp = epd.width - 1 - x_epd
+                     pixel_index_in_row = x_bmp * 3
                      if pixel_index_in_row + 2 < row_size_actual: # 実データ範囲内
                         blue = row_data[pixel_index_in_row]
                         green = row_data[pixel_index_in_row + 1]
@@ -401,7 +402,7 @@ def time_sync():
 
 def get_next_runtime():
     """
-    現在時刻から次の実行時刻(05:20, 11:20, 17:20)までの秒数を計算する
+    現在時刻から次の実行時刻(01:20, 05:20, 11:20, 17:20)までの秒数を計算する
     Returns:
         int: 次の実行時刻までの待機秒数
     """
@@ -411,6 +412,7 @@ def get_next_runtime():
 
     # 実行時刻のリスト（1日の秒数に変換）
     run_times = [
+        (1 * 3600) + (20 * 60),   # 01:20
         (5 * 3600) + (20 * 60),   # 05:20
         (11 * 3600) + (20 * 60),  # 11:20
         (17 * 3600) + (20 * 60),  # 17:20
@@ -519,57 +521,84 @@ def jwt_encode(payload, pem_content, algorithm="RS256"):
     signature = _to_b64url(sign(message, key, "SHA-256"))
     return (header + b"." + payload + b"." + signature).decode()
 
+def is_active_time():
+    """
+    現在時刻が起動時間帯（各時刻から45分間）かどうかを判定する
+    Returns:
+        bool: 起動時間帯であればTrue、それ以外はFalse
+    """
+    current_time = utime.time() + (9 * 3600)  # UTC+9へ調整
+    day_seconds = current_time % 86400   # 当日の経過秒数
+
+    # 各実行時刻（秒）とその45分後の時刻
+    active_periods = [
+        ((1 * 3600) + (20 * 60), (1 * 3600) + (65 * 60)),   # 01:20-02:05
+        ((5 * 3600) + (20 * 60), (5 * 3600) + (65 * 60)),   # 05:20-06:05
+        ((11 * 3600) + (20 * 60), (11 * 3600) + (65 * 60)), # 11:20-12:05
+        ((17 * 3600) + (20 * 60), (17 * 3600) + (65 * 60)), # 17:20-18:05
+    ]
+
+    # いずれかの時間帯に該当するかチェック
+    for start, end in active_periods:
+        if start <= day_seconds < end:
+            return True   
+    return False
 
 # main関数
 def main():
+    status_led = machine.Pin('LED', machine.Pin.OUT)
+    status_led.value(1)
     
-    print("Initializing EPD...")
-    epd.init()
-    
-    load_config()
-    
-    print("Connecting to WiFi...")
-    if not connect_wifi():
-        print("WiFi connection failed.")
-        machine.lightsleep(10000)
+    try:
+        print("Initializing EPD...")
+        epd.init()
+        
+        load_config()
+        
+        print("Connecting to WiFi...")
+        if not connect_wifi():
+            print("WiFi connection failed.")
 
-        print("Clearing EPD...")
-        epd.Clear()
+            machine.reset()
+            
+        time_sync()
 
+        if is_active_time():
+            renew_token()
+            
+            gc.collect()
+            print(f"Initial memory free: {gc.mem_free()} bytes")
+                
+            gc.collect()
+            print(f"Memory after EPD init/clear: {gc.mem_free()} bytes")
+
+            # BMP表示関数を呼び出す
+            display_bmp_from_url(url, epd)
+
+            gc.collect()
+            print(f"Memory free after display attempt: {gc.mem_free()} bytes")
+        else:
+            print("Not in active time. Skipping display.")
+
+        wlan.disconnect()
+        wlan.active(False)
+        
+        
+        machine.Pin(23, machine.Pin.OUT).low()
+        wait_time = get_next_runtime() * 1000  # ミリ秒に変換
+        if wait_time > 1800 * 1000:
+            wait_time = 1800 * 1000
+        print(f"Sleeping for {wait_time / 1000} seconds until next run.")
+        
+        print("Putting EPD to sleep.")
+        epd.sleep()
+        print("EPD is sleeping.")
+        
+        status_led.value(0)
+        
+        machine.deepsleep(wait_time)
+    except Exception:
         machine.reset()
-        
-    time_sync()
-    renew_token()
-    
-    gc.collect()
-    print(f"Initial memory free: {gc.mem_free()} bytes")
-        
-    gc.collect()
-    print(f"Memory after EPD init/clear: {gc.mem_free()} bytes")
-
-    # BMP表示関数を呼び出す
-    display_bmp_from_url(url, epd)
-
-    gc.collect()
-    print(f"Memory free after display attempt: {gc.mem_free()} bytes")
-
-
-
-    wlan.disconnect()
-    wlan.active(False)
-    
-    
-    machine.Pin(23, machine.Pin.OUT).low()
-    wait_time = get_next_runtime() * 1000  # ミリ秒に変換
-    if wait_time > 1800 * 1000:
-        wait_time = 1800 * 1000
-    print(f"Sleeping for {wait_time / 1000} seconds until next run.")
-    
-    print("Putting EPD to sleep.")
-    epd.sleep()
-    print("EPD is sleeping.")
-    
-    machine.deepsleep(wait_time)
 
 if __name__ == "__main__":
     main()
